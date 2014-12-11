@@ -1,3 +1,4 @@
+targets: seektest subset bucket
 
-subset: subset.cpp
+%: %.cpp
 	g++ $^ -O3 -o $@ -std=c++11 -ggdb3 -lhts -lpthread
