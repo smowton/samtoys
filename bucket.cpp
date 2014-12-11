@@ -1,4 +1,47 @@
 
+#include <htslib/hts.h>
+#include <htslib/sam.h>
+#include <htslib/ksort.h>
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <ctype.h>
+
+// Stolen from bam_sort.c to sort by qname.
+
+typedef bam1_t *bam1_p;
+
+static int strnum_cmp(const char *_a, const char *_b)
+{
+    const unsigned char *a = (const unsigned char*)_a, *b = (const unsigned char*)_b;
+    const unsigned char *pa = a, *pb = b;
+    while (*pa && *pb) {
+        if (isdigit(*pa) && isdigit(*pb)) {
+            while (*pa == '0') ++pa;
+            while (*pb == '0') ++pb;
+            while (isdigit(*pa) && isdigit(*pb) && *pa == *pb) ++pa, ++pb;
+            if (isdigit(*pa) && isdigit(*pb)) {
+                int i = 0;
+                while (isdigit(pa[i]) && isdigit(pb[i])) ++i;
+                return isdigit(pa[i])? 1 : isdigit(pb[i])? -1 : (int)*pa - (int)*pb;
+            } else if (isdigit(*pa)) return 1;
+            else if (isdigit(*pb)) return -1;
+            else if (pa - a != pb - b) return pa - a < pb - b? 1 : -1;
+        } else {
+            if (*pa != *pb) return (int)*pa - (int)*pb;
+            ++pa; ++pb;
+        }
+    }
+    return *pa? 1 : *pb? -1 : 0;
+}
+
+static inline int bam1_lt(const bam1_p a, const bam1_p b)
+{
+  int t = strnum_cmp(bam_get_qname(a), bam_get_qname(b));
+  return (t < 0 || (t == 0 && (a->core.flag&0xc0) < (b->core.flag&0xc0)));
+}
+KSORT_INIT(sort, bam1_p, bam1_lt)
+
 int main(int argc, char *argv[])
 {
 
@@ -13,7 +56,7 @@ int main(int argc, char *argv[])
   bam_hdr_t* header = sam_hdr_read(in);
 
   int n_outs = argc - 1;
-  samFile** outs = calloc(sizeof(samFile*), n_outs);
+  samFile** outs = (samFile**)calloc(sizeof(samFile*), n_outs);
   if(!outs) {
     fprintf(stderr, "Malloc 1\n");
     exit(1);
@@ -33,7 +76,7 @@ int main(int argc, char *argv[])
     sam_hdr_write(outs[i], header);
   }
 
-  bam1_t* buckets = calloc(sizeof(bam1_t), n_outs - 1);
+  bam1_t* buckets = (bam1_t*)calloc(sizeof(bam1_t), n_outs - 1);
   if(!buckets) {
     fprintf(stderr, "Malloc 2\n");
     exit(1);
@@ -66,7 +109,6 @@ int main(int argc, char *argv[])
 
   }
 
-  g_is_by_qname = 0;
   bam1_t rd;
 	
   while(sam_read1(in, header, &rd) >= 0) {
