@@ -4,15 +4,24 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <vector>
 #include <algorithm>
+#include <string>
 
 #include <htslib/hts.h>
 #include <htslib/sam.h>
 #include <htslib/bgzf.h>
 
+enum cmptypes {
+  
+  cmptype_sequence,
+  cmptype_mate
+
+};
+
 static void usage() {
 
-  fprintf(stderr, "Usage: intersect -a input1.s/b/cram -b input2.s/b/cram [-m matching_records.s/b/cram] [-1 first_only.s/b/cram] [-2 second_only.s/b/cram] [-t nthreads] [-B iobuffersize]\n");
+  fprintf(stderr, "Usage: intersect -a input1.s/b/cram -b input2.s/b/cram [-m matching_records.s/b/cram] [-1 first_only.s/b/cram] [-2 second_only.s/b/cram] [-t nthreads] [-B iobuffersize] [-c comparison_type]\n");
   exit(1);
 
 }
@@ -73,6 +82,36 @@ struct SamReader {
 
 };
 
+cmptypes cmptype;
+
+static int32_t get_alignment_score(bam1_t* rec) {
+  
+  uint8_t* score_rec = bam_aux_get(rec, "AS");
+  if(!score_rec) {
+    return rec->core.qual;
+  }
+  else {
+    return bam_aux2i(score_rec);
+  }
+
+}
+
+static int flag2mate(const bam1_t* rec) {
+
+  if(rec->core.flag & BAM_FREAD1)
+    return 1;
+  else if(rec->core.flag & BAM_FREAD2)
+    return 2;
+  return 0;
+
+}
+
+static bool mate_eq(const bam1_t* a, const bam1_t* b) {
+
+  return flag2mate(a) == flag2mate(b);
+
+}
+
 static bool sequence_eq(const bam1_t* a, const bam1_t* b) {
 
   const unsigned char* seqa = bam_get_seq(a);
@@ -86,6 +125,21 @@ static bool sequence_eq(const bam1_t* a, const bam1_t* b) {
 
   return true;
     
+}
+
+static bool bamrec_eq(const bam1_t* a, const bam1_t* b) {
+  switch(cmptype) {
+  case cmptype_sequence:
+    return sequence_eq(a, b);
+  case cmptype_mate:
+    return mate_eq(a, b);
+  }
+}
+
+static bool mate_lt(const bam1_t* a, const bam1_t* b) {
+
+  return flag2mate(a) < flag2mate(b);
+
 }
 
 static bool sequence_lt(const bam1_t* a, const bam1_t* b) {
@@ -103,6 +157,15 @@ static bool sequence_lt(const bam1_t* a, const bam1_t* b) {
 
   return a->core.l_qseq < b->core.l_qseq;
 
+}
+
+static bool bamrec_lt(const bam1_t* a, const bam1_t* b) {
+  switch(cmptype) {
+  case cmptype_sequence:
+    return sequence_lt(a, b);
+  case cmptype_mate:
+    return mate_lt(a, b);
+  }
 }
 
 struct BamRecVector {
@@ -128,8 +191,8 @@ struct BamRecVector {
     recs.clear();
   }
 
-  void sort_by_sequence() {
-    std::sort(recs.begin(), recs.end(), sequence_lt);
+  void sort() {
+    std::sort(recs.begin(), recs.end(), bamrec_lt);
   }
 
 };
@@ -140,9 +203,10 @@ int main(int argc, char** argv) {
 
   int nthreads = 1;
   size_t buffersize = 0;
+  char* cmptypestr = "sequence";
 
   char c;
-  while ((c = getopt(argc, argv, "a:b:m:1:2:t:B:")) >= 0) {
+  while ((c = getopt(argc, argv, "a:b:m:1:2:c:t:B:")) >= 0) {
     switch (c) {
     case 'a':
       in1_name = optarg;
@@ -165,6 +229,9 @@ int main(int argc, char** argv) {
     case 'B':
       buffersize = atoi(optarg);
       break;
+    case 'c':
+      cmptypestr = optarg;
+      break;
     default:
       usage();
     }
@@ -178,6 +245,13 @@ int main(int argc, char** argv) {
     fprintf(stderr, "intersect is useless without at least one of -m -1 and -2\n");
     usage();
   }
+
+  if(!strcmp(cmptypestr, "sequence"))
+    cmptype = cmptype_sequence;
+  else if(!strcmp(cmptypestr, "mate"))
+    cmptype = cmptype_mate;
+  else
+    usage();
   
   htsFile *in1hf = 0, *in2hf = 0, *both_out = 0, *first_out = 0, *second_out = 0;
   in1hf = hts_begin_or_die(in1_name, "r", 0, nthreads, buffersize);
@@ -216,24 +290,42 @@ int main(int argc, char** argv) {
 	in1.next();
       }
       
-      seqs1.sort_by_sequence();
+      seqs1.sort();
 
       while((!in2.is_eof()) && (qn = bam_get_qname(in2.rec)) == qname2) {
 	seqs2.copy_add(in2.rec);
 	in2.next();
       }
 
-      seqs2.sort_by_sequence();
+      seqs2.sort();
 
       int idx1 = 0, idx2 = 0;
       while(idx1 < seqs1.recs.size() && idx2 < seqs2.recs.size()) {
 
-	if(sequence_eq(seqs1.recs[idx1], seqs2.recs[idx2])) {
+	if(bamrec_eq(seqs1.recs[idx1], seqs2.recs[idx2])) {
+
+	  int32_t score1 = get_alignment_score(seqs1.recs[idx1]);
+	  int32_t score2 = get_alignment_score(seqs2.recs[idx2]);
+
+	  // Specifically the second file might have multiple mappings. Use the best alignment score given,
+	  // and skip the rest.
+	  while(idx2 + 1 < seqs2.recs.size() && bamrec_eq(seqs1.recs[idx1], seqs2.recs[idx2 + 1])) {
+	    ++idx2;
+	    score2 = std::max(score2, get_alignment_score(seqs2.recs[idx2]));
+	  }
+	  	  
+	  uint32_t human_better = 1;
+	  
+	  if(score1 > score2)
+	    bam_aux_append(seqs1.recs[idx1], "hb", 'i', sizeof(uint32_t), (uint8_t*)&human_better);  
+
 	  if(both_out)
 	    sam_write1(both_out, header1, seqs1.recs[idx1]);
+
 	  ++idx1; ++idx2;
+
 	}
-	else if(sequence_lt(seqs1.recs[idx1], seqs2.recs[idx2])) {
+	else if(bamrec_lt(seqs1.recs[idx1], seqs2.recs[idx2])) {
 	  if(first_out)
 	    sam_write1(first_out, header1, seqs1.recs[idx1]);
 	  ++idx1;
@@ -252,7 +344,7 @@ int main(int argc, char** argv) {
 
       for(;idx2 < seqs2.recs.size(); ++idx2) 
 	if(second_out)
-	  sam_write1(first_out, header1, seqs2.recs[idx2]);
+	  sam_write1(second_out, header1, seqs2.recs[idx2]);
 
     }
     else if(qname1 < qname2) {
