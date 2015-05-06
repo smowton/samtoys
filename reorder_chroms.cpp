@@ -17,16 +17,14 @@ int main(int argc, char** argv) {
   for(int i = 1; i < 23; ++i) {
 
     char chrbuf[32];
-    sprintf(chrbuf, "chr%d", i);
+    sprintf(chrbuf, "%d", i);
     newOrder.push_back(std::string(chrbuf));
 
   }
     
-  newOrder.push_back("chrX");
-  newOrder.push_back("chrY");
-  newOrder.push_back("chrM_rCRS");
-
-  std::sort(newOrder.begin(), newOrder.end());
+  newOrder.push_back("X");
+  newOrder.push_back("Y");
+  newOrder.push_back("MT");
 
   htsFile* hf = hts_open(argv[1], "r");
   if(!hf) {
@@ -92,6 +90,19 @@ int main(int argc, char** argv) {
       exit(1);
     }
     htext.erase(sqstart, (nextnl - sqstart) + 1);
+  }
+
+  // Replace @SQ lines, for legacy readers:
+  if(htext.size() > 0 && htext[htext.size()-1] != '\n')
+    htext += "\n";
+
+  for(int32_t i = 0; i < newheader->n_targets; ++i) {
+    char buf[128];
+    if(snprintf(buf, 128, "@SQ\tSN:%s\tLN:%u\n", newheader->target_name[i], newheader->target_len[i]) > 128) {
+      fprintf(stderr, "Sequence name too long!\n");
+      exit(1);
+    }
+    htext += std::string(buf);
   }
 
   free(newheader->text);

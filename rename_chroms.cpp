@@ -15,13 +15,13 @@ int main(int argc, char** argv) {
 
     char chrbuf[32];
     sprintf(chrbuf, "chr%d", i);
-    new_chroms[std::string(chrbuf+3)] = std::string(chrbuf);
+    new_chroms[std::string(chrbuf)] = std::string(chrbuf+3);
 
   }
     
-  new_chroms["X"] = "chrX";
-  new_chroms["Y"] = "chrY";
-  new_chroms["MT"] = "chrM_rCRS";
+  new_chroms["chrX"] = "X";
+  new_chroms["chrY"] = "Y";
+  new_chroms["chrM_rCRS"] = "MT";
 
   htsFile* hf = hts_open(argv[1], "r");
   if(!hf) {
