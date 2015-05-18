@@ -22,6 +22,7 @@ int main(int argc, char** argv) {
   new_chroms["chrX"] = "X";
   new_chroms["chrY"] = "Y";
   new_chroms["chrM_rCRS"] = "MT";
+  new_chroms["chrM"] = "MT";
 
   htsFile* hf = hts_open(argv[1], "r");
   if(!hf) {

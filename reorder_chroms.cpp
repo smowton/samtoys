@@ -11,8 +11,6 @@
 
 int main(int argc, char** argv) {
 
-  // Aim for alphabetical, not chromosome order.
-
   std::vector<std::string> newOrder;
   for(int i = 1; i < 23; ++i) {
 
