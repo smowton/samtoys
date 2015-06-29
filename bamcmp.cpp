@@ -70,7 +70,7 @@ static void usage() {
   fprintf(stderr, "Usage: intersect -a input1.s/b/cram -b input2.s/b/cram [-1 first_only.xam] [-A first_better.xam] [-B second_better.xam] [-2 second_only.xam] [-t nthreads] [-n | -N] [-s scoring_method] [-c comparison_type]\n");
   fprintf(stderr, "\t-n\tExpect input sorted as per samtools -n (Mixed string / integer ordering, default)\n");
   fprintf(stderr, "\t-N\tExpect input sorted as per Picard / htsjdk name ordering (lexical ordering)\n");
-  fprintf(stderr, "\t-s match\tScore hits by the number of bases that match the reference, as given by the CIGAR string and NM / MD attributes\n");
+  fprintf(stderr, "\t-s match\tScore hits by the number of bases that match the reference, as given by the CIGAR string and NM / MD attributes (default)\n");
   fprintf(stderr, "\t-s as\tScore hits according to the AS attribute written by some aligners\n");
   fprintf(stderr, "\t-s mapq\tScore hits according to the MAPQ SAM field\n");
   exit(1);
