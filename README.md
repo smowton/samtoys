@@ -7,6 +7,8 @@ Small htslib-based toys
 * **samflags.py**: Replace SAM flags field with a human-readable list-of-flags.
 * **filter_match_ratio**: Filter a ?AM file by the proportion of the read mapped according to the CIGAR string
 * **bamcmp**: Compare alignment scores between two qname-sorted ?AMs.
+* **filter_attr**: Filters a ?AM file by a simple expression on hit attributes, e.g. AS > BS, or AS == 5
+* **contig_pileup**: Count the number of contig <-> contig bridges formed by paired reads
 * **seektest**: Test that seek functionality still appears to work, for developers.
 
 More toys coming as I need them :) Note that some of these tools use my fork of htslib to improve I/O efficiency. You can use that fork to build them, or else just comment out the incompatible changes, such as using hts_set_opt to configure I/O buffer sizes.
