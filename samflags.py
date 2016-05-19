@@ -5,7 +5,7 @@ import errno
 
 flag_code = {
     1: 'M',
-    2: '',
+    2: 'P',
     4: 'U',
     8: 'u',
     16: 'R',
