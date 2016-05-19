@@ -40,6 +40,7 @@ int main(int argc, char** argv) {
   std::cerr << "Read " << keep_qnames.size() << " Qnames\n";
 
   htsFile* hfi = hts_open("-", "r");
+  //hts_set_opt(hfi, HTSOL_FILEIO, HTS_FILEIO_BUFFER_SIZE, (size_t)4194304);
   if(argc >= 3) {
 
     int nthreads = strtol(argv[2], 0, 0);
