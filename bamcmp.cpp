@@ -13,18 +13,12 @@
 #include <htslib/sam.h>
 #include <htslib/bgzf.h>
 
-enum cmptypes {
-  
-  cmptype_sequence,
-  cmptype_mate
-
-};
-
 enum scoringmethods {
   
   scoringmethod_nmatches,
   scoringmethod_astag,
-  scoringmethod_mapq
+  scoringmethod_mapq,
+  scoringmethod_balwayswins
 
 };
 
@@ -67,12 +61,13 @@ static int qname_cmp(const char* qa, const char* qb) {
 
 static void usage() {
 
-  fprintf(stderr, "Usage: intersect -a input1.s/b/cram -b input2.s/b/cram [-1 first_only.xam] [-A first_better.xam] [-B second_better.xam] [-2 second_only.xam] [-t nthreads] [-n | -N] [-s scoring_method] [-c comparison_type]\n");
+  fprintf(stderr, "Usage: intersect -1 input1.s/b/cram -2 input2.s/b/cram [-a first_only.xam] [-b second_only.xam] [-A first_better.xam] [-B second_better.xam] [-C first_worse.xam] [-D second_worse.xam] [-t nthreads] [-n | -N] [-s scoring_method]\n");
   fprintf(stderr, "\t-n\tExpect input sorted as per samtools -n (Mixed string / integer ordering, default)\n");
   fprintf(stderr, "\t-N\tExpect input sorted as per Picard / htsjdk name ordering (lexical ordering)\n");
   fprintf(stderr, "\t-s match\tScore hits by the number of bases that match the reference, as given by the CIGAR string and NM / MD attributes (default)\n");
   fprintf(stderr, "\t-s as\tScore hits according to the AS attribute written by some aligners\n");
   fprintf(stderr, "\t-s mapq\tScore hits according to the MAPQ SAM field\n");
+  fprintf(stderr, "\t-s balwayswins\tAlways award hits to input B, regardless of alignment scores (equivalent to filtering A by any read mapped in B)\n");
   exit(1);
 
 }
@@ -98,7 +93,330 @@ static htsFile* hts_begin_or_die(const char* filename, const char* mode, bam_hdr
 
 }
 
-cmptypes cmptype;
+class htsFileWrapper {
+
+  std::string fname;
+  const char* mode;
+  htsFile* hts;
+  uint32_t refCount;
+  int nthreads;
+  int header2_offset;
+
+  bam_hdr_t* header1;
+  bam_hdr_t* header2;
+  bam_hdr_t* headerout;
+
+  void checkHeaderNotWritten() {
+    if(headerout) {
+      fprintf(stderr, "htsFileWrapper header changed after already being written\n");
+      exit(1);
+    }
+  }
+
+public:
+  
+  void setHeader1(bam_hdr_t* h1) {
+    checkHeaderNotWritten();
+    header1 = h1;
+  }
+
+  void setHeader2(bam_hdr_t* h2) {
+    checkHeaderNotWritten();
+    header2 = h2;
+  }
+
+  void ref() {
+    ++refCount;
+  }
+
+  uint32_t unref() {
+
+    checkStarted();
+
+    if(refCount == 1)
+      hts_close(hts);
+
+    return --refCount;
+
+  }
+
+  htsFileWrapper(const std::string& _fname, const char* _mode, int _nthreads) : 
+    fname(_fname), mode(_mode), hts(0), refCount(1), nthreads(_nthreads), header2_offset(0), header1(0), header2(0), headerout(0) { }
+
+  void checkStarted() {
+
+    if(hts)
+      return;
+    
+    if(!(header1 || header2)) {
+      fprintf(stderr, "Started writing records without any header\n");
+      exit(1);
+    }
+    else if(!header2)
+      headerout = header1;
+    else if(!header1)
+      headerout = header2;
+    else {
+
+      header2_offset = header1->n_targets;
+
+      headerout = bam_hdr_dup(header1);
+      headerout->n_targets += header2->n_targets;
+      headerout->target_len = (uint32_t*)realloc(headerout->target_len, sizeof(uint32_t) * headerout->n_targets);
+      headerout->target_name = (char**)realloc(headerout->target_name, sizeof(char*) * headerout->n_targets);
+
+      if((!headerout->target_len) || (!headerout->target_name))
+	goto oom;
+
+      // Prefix header1 names with A_
+
+      for(int i = 0; i < header1->n_targets; ++i) {
+	int len = strlen(headerout->target_name[i]);
+	headerout->target_name[i] = (char*)realloc(headerout->target_name[i], len + 3); // A_ prefix plus null terminator
+	if(!headerout->target_name[i])
+	  goto oom;
+	memmove(headerout->target_name[i] + 2, headerout->target_name[i], len + 1);
+	memcpy(headerout->target_name[i], "A_", 2);
+      }
+      
+      // Copy header2 names; add B_ prefix
+
+      for(int i = 0; i < header2->n_targets; ++i) {
+	headerout->target_len[i + header2_offset] = header2->target_len[i];
+	headerout->target_name[i + header2_offset] = (char*)malloc(strlen(header2->target_name[i]) + 3);
+	if(!headerout->target_name[i + header2_offset])
+	  goto oom;
+	sprintf(headerout->target_name[i + header2_offset], "B_%s", header2->target_name[i]);
+      }
+
+      // Find all text @SQ records in header2:
+      
+      std::vector<std::pair<int, int> > sqheaders;
+
+      int offset = 0;
+      char* sq_start;
+      while((sq_start = strstr(header2->text + offset, "@SQ")) != 0) {
+
+	// Must occur at the start of the header or after a newline:
+	if(sq_start != header2->text && (*(sq_start - 1)) != '\n') {
+	  ++offset;
+	  continue;
+	}
+
+	int start_off = sq_start - header2->text;
+	int end_off;
+
+	char* nl = strchr(sq_start, '\n');
+	if(!nl)
+	  end_off = strlen(header2->text);
+	else
+	  end_off = nl - header2->text;
+
+	sqheaders.push_back(std::make_pair(start_off, end_off));
+	
+	offset = end_off;
+
+      }
+
+      // Count how much extra we're going to add to header1:
+
+      int additional_bytes = (2 * header1->n_targets); // A_ prefix for all existing @SQs
+      
+      for(int i = 0, ilim = sqheaders.size(); i != ilim; ++i)
+	additional_bytes += ((sqheaders[i].second - sqheaders[i].first) + 3); // Existing header, plus a newline, plus B_ prefix.
+
+      free(headerout->text);
+      headerout->text = (char*)malloc(headerout->l_text + additional_bytes + 1); // Null terminator as well?
+      headerout->l_text += additional_bytes;
+      if(!headerout->text)
+	goto oom;
+
+      // Rewrite: copy header1 lines, except for @SQs which gain an A_ prefix, and insert the (prefixed) header2 @SQs
+      // after the last one from header1.
+
+      char* nl;
+      char* read_offset = header1->text;
+      char* write_offset = headerout->text;
+      bool more_to_read = true;
+      int sqs_remaining = header1->n_targets;
+      while(more_to_read) {
+
+	nl = strchr(read_offset, '\n');
+	if(!nl) {
+	  nl = header1->text + header1->l_text;
+	  more_to_read = false;
+	}
+	else {
+	  // Include the newline when copying.
+	  ++nl;
+	}
+
+	if(strncmp(read_offset, "@SQ", 3) == 0) {
+
+	  char* sn_offset = strstr(read_offset, "SN:");
+	  if(sn_offset) {
+	    
+	    // Prefix A_ to the @SQ line
+	    char* insert_offset = sn_offset + 3;
+	    int len = insert_offset - read_offset;
+	    memcpy(write_offset, read_offset, len);
+
+	    write_offset += len; read_offset += len;
+
+	    memcpy(write_offset, "A_", 2);
+	    write_offset += 2;
+
+	    len = nl - read_offset;
+	    memcpy(write_offset, read_offset, len);
+
+	    write_offset += len; read_offset += len;
+
+	    if(!more_to_read) {
+	      // Adding at the end; add newline.
+	      *(write_offset++) = '\n';
+	    }
+
+	    if(!(--sqs_remaining)) {
+
+	      // That was the last of header1's @SQ lines. Insert header2's lines here.
+	      for(int i = 0, ilim = sqheaders.size(); i != ilim; ++i) {
+
+		int h2readoff = sqheaders[i].first;
+		int h2readlim = sqheaders[i].second;
+
+		char* h2sn = strstr(header2->text + h2readoff, "SN:");
+		if(h2sn) {
+
+		  // Skip over the SN: tag
+		  h2sn += 3;
+
+		  int h2insoff = h2sn - header2->text;
+		  int len = h2insoff - h2readoff;
+
+		  memcpy(write_offset, header2->text + h2readoff, len);
+		  write_offset += len;
+
+		  memcpy(write_offset, "B_", 2);
+		  write_offset += 2;
+
+		  len = h2readlim - h2insoff;
+		  memcpy(write_offset, header2->text + h2insoff, len);
+		  write_offset += len;
+
+		}
+		else {
+
+		  int len = h2readlim - h2readoff;
+		  memcpy(write_offset, header2->text + h2readoff, len);
+		  write_offset += len;
+
+		}
+
+		if(more_to_read || i != ilim - 1)
+		  *(write_offset++) = '\n';
+
+	      }
+
+	    }
+
+	    continue;
+
+	  }
+
+	  // Else fall through to just copy the whole line:
+	  
+	}
+
+	// Just a regular header line: copy it all:
+	
+	int len = nl - read_offset;
+	memcpy(write_offset, read_offset, len);
+	write_offset += len; read_offset += len;
+
+      }
+
+      headerout->text[headerout->l_text] = '\0';
+				
+    }
+
+    // Header complete, now open and write it:
+    
+    hts = hts_begin_or_die(fname.c_str(), mode, headerout, nthreads);
+    return;
+
+  oom:
+
+    fprintf(stderr, "Malloc failure while building combined header\n");
+    exit(1);
+
+  }
+
+  void write1(int headerNum, bam1_t* rec) {
+
+    checkStarted();
+
+    if(headerNum == 2) {
+      if(rec->core.tid != -1)
+	rec->core.tid += header2_offset;
+      if(rec->core.mtid != -1)
+	rec->core.mtid += header2_offset;
+    }
+
+    sam_write1(hts, headerout, rec);
+
+    if(headerNum == 2) {
+      if(rec->core.tid != -1)
+	rec->core.tid -= header2_offset;
+      if(rec->core.mtid != -1)
+	rec->core.mtid -= header2_offset;
+    }
+
+  }
+
+};
+
+static void htswrapper_close(htsFileWrapper* f) {
+
+  if(!f->unref())
+    delete f;
+
+}
+
+static std::vector<std::pair<std::string, htsFileWrapper*> > openOutputs;
+
+static htsFileWrapper* htswrapper_begin_or_die(const char* fname, const char* mode, bam_hdr_t* header, int inputNumber, int nthreads) {
+
+  if(inputNumber != 1 && inputNumber != 2) {
+    fprintf(stderr, "inputNumber must be 1 or 2\n");
+    exit(1);
+  }
+
+  htsFileWrapper* ret = 0;
+
+  std::string sfname(fname);
+  for(std::vector<std::pair<std::string, htsFileWrapper*> >::iterator it = openOutputs.begin(), itend = openOutputs.end(); it != itend && !ret; ++it) {
+
+    if(it->first == sfname) {
+      it->second->ref();
+      ret = it->second;
+    }
+
+  }
+
+  if(!ret) {
+    ret = new htsFileWrapper(sfname, mode, nthreads);
+    openOutputs.push_back(std::make_pair(sfname, ret));
+  }
+
+  if(inputNumber == 1)
+    ret->setHeader1(header);
+  else
+    ret->setHeader2(header);  
+
+  return ret;
+
+}
+
 scoringmethods scoringmethod;
 
 bool warned_nm_anomaly = false;
@@ -120,7 +438,7 @@ static bool aux_is_int(uint8_t* rec) {
 
 }
 
-static uint32_t get_alignment_score(bam1_t* rec) {
+static uint32_t get_alignment_score(bam1_t* rec, bool is_input_a) {
   
   switch(scoringmethod) {
   case scoringmethod_nmatches:
@@ -250,6 +568,17 @@ static uint32_t get_alignment_score(bam1_t* rec) {
 
   case scoringmethod_mapq:
     return rec->core.qual;
+
+  case scoringmethod_balwayswins:
+
+    // Mapped B records beat any A record, beats an unmapped B record.
+    if(is_input_a)
+      return 1;
+    else if(!(rec->core.flag & BAM_FUNMAP))
+      return 2;
+    else
+      return 0;
+
   }
 
 }
@@ -264,66 +593,12 @@ static int flag2mate(const bam1_t* rec) {
 
 }
 
-static bool mate_eq(const bam1_t* a, const bam1_t* b) {
-
-  return flag2mate(a) == flag2mate(b);
-
-}
-
-static bool sequence_eq(const bam1_t* a, const bam1_t* b) {
-
-  const unsigned char* seqa = bam_get_seq(a);
-  const unsigned char* seqb = bam_get_seq(b);
-  if(a->core.l_qseq != b->core.l_qseq)
-    return false;
-
-  for(unsigned i = 0, ilim = a->core.l_qseq; i != ilim; ++i) 
-    if(bam_seqi(seqa, i) != bam_seqi(seqb, i))
-      return false;
-
-  return true;
-    
-}
-
 static bool bamrec_eq(const bam1_t* a, const bam1_t* b) {
-  switch(cmptype) {
-  case cmptype_sequence:
-    return sequence_eq(a, b);
-  case cmptype_mate:
-    return mate_eq(a, b);
-  }
-}
-
-static bool mate_lt(const bam1_t* a, const bam1_t* b) {
-
-  return flag2mate(a) < flag2mate(b);
-
-}
-
-static bool sequence_lt(const bam1_t* a, const bam1_t* b) {
-
-  const unsigned char* seqa = bam_get_seq(a);
-  const unsigned char* seqb = bam_get_seq(b);
-  for(unsigned i = 0, ilim = std::min(a->core.l_qseq, b->core.l_qseq); i != ilim; ++i) {
-    char basea = bam_seqi(seqa, i);
-    char baseb = bam_seqi(seqb, i);
-    if(basea < baseb)
-      return true;
-    else if(basea > baseb)
-      return false;
-  }
-
-  return a->core.l_qseq < b->core.l_qseq;
-
+  return flag2mate(a) == flag2mate(b);
 }
 
 static bool bamrec_lt(const bam1_t* a, const bam1_t* b) {
-  switch(cmptype) {
-  case cmptype_sequence:
-    return sequence_lt(a, b);
-  case cmptype_mate:
-    return mate_lt(a, b);
-  }
+  return flag2mate(a) < flag2mate(b);
 }
 
 struct SamReader {
@@ -402,9 +677,46 @@ struct BamRecVector {
 
 };
 
+static bool uniqueValue(const std::vector<htsFileWrapper*>& in) {
+
+  bool outValid = false;
+  htsFileWrapper* out = 0;
+
+  for(std::vector<htsFileWrapper*>::const_iterator it = in.begin(), itend = in.end(); it != itend; ++it) {
+
+    if(!outValid) {
+      out = *it;
+      outValid = true;
+    }
+    else if(out != *it) {
+      return false;
+    }
+
+  }
+
+  return outValid;
+
+}
+
+static void clearMateInfo(BamRecVector& v) {
+
+  for(int i = 0, ilim = v.recs.size(); i != ilim; ++i) {
+    
+    uint32_t maten = (uint32_t)flag2mate(v.recs[i]);
+    bam_aux_append(v.recs[i], "om", 'i', sizeof(uint32_t), (uint8_t*)&maten);  
+
+    v.recs[i]->core.flag &= ~(BAM_FPROPER_PAIR | BAM_FMREVERSE | BAM_FPAIRED | BAM_FMUNMAP | BAM_FREAD1 | BAM_FREAD2);
+    v.recs[i]->core.mtid = -1;
+    v.recs[i]->core.mpos = -1;
+
+  }
+
+}
+
 int main(int argc, char** argv) {
 
-  char *in1_name = 0, *in2_name = 0, *firstbetter_name = 0, *secondbetter_name = 0, *first_name = 0, *second_name = 0;
+  char *in1_name = 0, *in2_name = 0, *firstbetter_name = 0, *secondbetter_name = 0, 
+    *firstworse_name = 0, *secondworse_name = 0, *first_name = 0, *second_name = 0;
 
   int nthreads = 1;
   size_t buffersize = 0;
@@ -412,18 +724,18 @@ int main(int argc, char** argv) {
   const char* scoring_method_string = "match";
 
   char c;
-  while ((c = getopt(argc, argv, "a:b:m:1:2:c:t:A:B:nNs:")) >= 0) {
+  while ((c = getopt(argc, argv, "a:b:m:1:2:t:A:B:C:D:nNs:")) >= 0) {
     switch (c) {
-    case 'a':
+    case '1':
       in1_name = optarg;
       break;
-    case 'b':
+    case '2':
       in2_name = optarg;
       break;
-    case '1':
+    case 'a':
       first_name = optarg;
       break;
-    case '2':
+    case 'b':
       second_name = optarg;
       break;
     case 'A':
@@ -432,11 +744,14 @@ int main(int argc, char** argv) {
     case 'B':
       secondbetter_name = optarg;
       break;
+    case 'C':
+      firstworse_name = optarg;
+      break;
+    case 'D':
+      secondworse_name = optarg;
+      break;
     case 't':
       nthreads = atoi(optarg);
-      break;
-    case 'c':
-      cmptypestr = optarg;
       break;
     case 'n':
       mixed_ordering = true;
@@ -467,17 +782,13 @@ int main(int argc, char** argv) {
     scoringmethod = scoringmethod_mapq;
   else if(!strcmp(scoring_method_string, "as"))
     scoringmethod = scoringmethod_astag;
+  else if(!strcmp(scoring_method_string, "balwayswins"))
+    scoringmethod = scoringmethod_balwayswins;
   else
     usage();
 
-  if(!strcmp(cmptypestr, "sequence"))
-    cmptype = cmptype_sequence;
-  else if(!strcmp(cmptypestr, "mate"))
-    cmptype = cmptype_mate;
-  else
-    usage();
-  
-  htsFile *in1hf = 0, *in2hf = 0, *firstbetter_out = 0, *secondbetter_out = 0, *first_out = 0, *second_out = 0;
+  htsFile *in1hf = 0, *in2hf = 0;
+  htsFileWrapper *firstbetter_out = 0, *secondbetter_out = 0, *firstworse_out = 0, *secondworse_out = 0, *first_out = 0, *second_out = 0;
   in1hf = hts_begin_or_die(in1_name, "r", 0, nthreads);
   in2hf = hts_begin_or_die(in2_name, "r", 0, nthreads);
 
@@ -485,28 +796,25 @@ int main(int argc, char** argv) {
   bam_hdr_t* header2 = sam_hdr_read(in2hf);
 
   // Permit the outputs using like headers to share a file if they gave the same name.
-  
+
   if(firstbetter_name)
-    firstbetter_out = hts_begin_or_die(firstbetter_name, "wb0", header1, nthreads);
+    firstbetter_out = htswrapper_begin_or_die(firstbetter_name, "wb0", header1, 1, nthreads);
   if(secondbetter_name)
-    secondbetter_out = hts_begin_or_die(secondbetter_name, "wb0", header2, nthreads);
-  if(first_name) {
-    if(firstbetter_name && !strcmp(firstbetter_name, first_name))
-      first_out = firstbetter_out;
-    else
-      first_out = hts_begin_or_die(first_name, "wb0", header1, nthreads);
-  }
-  if(second_name) {
-    if(secondbetter_name && !strcmp(secondbetter_name, second_name))
-      second_out = secondbetter_out;
-    else
-      second_out = hts_begin_or_die(second_name, "wb0", header2, nthreads);
-  }
+    secondbetter_out = htswrapper_begin_or_die(secondbetter_name, "wb0", header2, 2, nthreads);
+  if(firstworse_name)
+    firstworse_out = htswrapper_begin_or_die(firstworse_name, "wb0", header1, 1, nthreads);
+  if(secondworse_name)
+    secondworse_out = htswrapper_begin_or_die(secondworse_name, "wb0", header2, 2, nthreads);
+  if(first_name)
+    first_out = htswrapper_begin_or_die(first_name, "wb0", header1, 1, nthreads);
+  if(second_name)
+    second_out = htswrapper_begin_or_die(second_name, "wb0", header2, 2, nthreads);
 
   SamReader in1(in1hf, header1, in1_name);
   SamReader in2(in2hf, header2, in2_name);
 
   BamRecVector seqs1, seqs2;
+  std::vector<htsFileWrapper*> seqs1Files, seqs2Files;
 
   while((!in1.is_eof()) && (!in2.is_eof())) {
 
@@ -517,6 +825,8 @@ int main(int argc, char** argv) {
       
       seqs1.clear();
       seqs2.clear();
+      seqs1Files.clear();
+      seqs2Files.clear();
 
       std::string qn;
       while((!in1.is_eof()) && (qn = bam_get_qname(in1.rec)) == qname1) {
@@ -525,6 +835,7 @@ int main(int argc, char** argv) {
       }
       
       seqs1.sort();
+      seqs1Files.resize(seqs1.recs.size(), 0);
 
       while((!in2.is_eof()) && (qn = bam_get_qname(in2.rec)) == qname2) {
 	seqs2.copy_add(in2.rec);
@@ -532,98 +843,116 @@ int main(int argc, char** argv) {
       }
 
       seqs2.sort();
+      seqs2Files.resize(seqs2.recs.size(), 0);
 
       int idx1 = 0, idx2 = 0;
       while(idx1 < seqs1.recs.size() && idx2 < seqs2.recs.size()) {
 
 	if(bamrec_eq(seqs1.recs[idx1], seqs2.recs[idx2])) {
 
-	  uint32_t score1 = get_alignment_score(seqs1.recs[idx1]);
-	  uint32_t score2 = get_alignment_score(seqs2.recs[idx2]);
+	  uint32_t score1 = 0;
+	  uint32_t score2 = 0; 
+
+	  int group_start_idx1 = idx1, group_start_idx2 = idx2;
+
+	  score1 = get_alignment_score(seqs1.recs[idx1], true);
+	  score2 = get_alignment_score(seqs2.recs[idx2], false);
 
 	  // Either input may have multiple candidate matches. Compare the best match found in each group
 	  // and then emit the whole group as firstbetter or secondbetter.
 	 
-	  int group_start_idx1 = idx1, group_start_idx2 = idx2;
-
 	  while(idx1 + 1 < seqs1.recs.size() && bamrec_eq(seqs1.recs[group_start_idx1], seqs1.recs[idx1 + 1])) {
 	    ++idx1;
-	    score1 = std::max(score1, get_alignment_score(seqs1.recs[idx1]));
+	    score1 = std::max(score1, get_alignment_score(seqs1.recs[idx1], true));
 	  }
 
 	  while(idx2 + 1 < seqs2.recs.size() && bamrec_eq(seqs1.recs[group_start_idx1], seqs2.recs[idx2 + 1])) {
 	    ++idx2;
-	    score2 = std::max(score2, get_alignment_score(seqs2.recs[idx2]));
+	    score2 = std::max(score2, get_alignment_score(seqs2.recs[idx2], false));
 	  }
 	  	  
-	  BamRecVector* writeseqs;
-	  uint32_t writefrom, writeto;
-	  htsFile* writefile;
-	  bam_hdr_t* writeheader;
+	  for(uint32_t i = group_start_idx1; i <= idx1; ++i) {
+	    bam_aux_append(seqs1.recs[i], "as", 'i', sizeof(uint32_t), (uint8_t*)&score1);  
+	    bam_aux_append(seqs1.recs[i], "bs", 'i', sizeof(uint32_t), (uint8_t*)&score2);  
+	  }
+
+	  for(uint32_t i = group_start_idx2; i <= idx2; ++i) {
+	    bam_aux_append(seqs2.recs[i], "as", 'i', sizeof(uint32_t), (uint8_t*)&score1);  
+	    bam_aux_append(seqs2.recs[i], "bs", 'i', sizeof(uint32_t), (uint8_t*)&score2);  
+	  }
+
+	  htsFileWrapper *firstRecordsFile, *secondRecordsFile;
 
 	  if(score1 > score2) {
-	    writeseqs = &seqs1;
-	    writefrom = group_start_idx1;
-	    writeto = idx1;
-	    writefile = firstbetter_out;
-	    writeheader = header1;
+	    firstRecordsFile = firstbetter_out;
+	    secondRecordsFile = secondworse_out;
 	  }
 	  else {
-	    writeseqs = &seqs2;
-	    writefrom = group_start_idx2;
-	    writeto = idx2;
-	    writefile = secondbetter_out;
-	    writeheader = header2;
+	    firstRecordsFile = firstworse_out;
+	    secondRecordsFile = secondbetter_out;
 	  }
-	 
-	  if(writefile) {
+	    
+	  for(uint32_t i = group_start_idx1; i <= idx1; ++i)
+	    seqs1Files[i] = firstRecordsFile;
 
-	    for(; writefrom <= writeto; ++writefrom) {
-	      
-	      bam_aux_append(writeseqs->recs[writefrom], "as", 'i', sizeof(uint32_t), (uint8_t*)&score1);  
-	      bam_aux_append(writeseqs->recs[writefrom], "bs", 'i', sizeof(uint32_t), (uint8_t*)&score2);  
-	      sam_write1(writefile, writeheader, writeseqs->recs[writefrom]);
-	      
-	    }
-
-	  }
+	  for(uint32_t i = group_start_idx2; i <= idx2; ++i)
+	    seqs2Files[i] = secondRecordsFile;
 
 	  ++idx1; ++idx2;
 
 	}
 	else if(bamrec_lt(seqs1.recs[idx1], seqs2.recs[idx2])) {
-	  if(first_out)
-	    sam_write1(first_out, header1, seqs1.recs[idx1]);
+	  seqs1Files[idx1] = first_out;	  
 	  ++idx1;
 	}
 	else {
-	  if(second_out)
-	    sam_write1(second_out, header1, seqs2.recs[idx2]);
+	  seqs2Files[idx2] = second_out;
 	  ++idx2;
 	}
 		   
       }
 
       for(;idx1 < seqs1.recs.size(); ++idx1) 
-	if(first_out)
-	  sam_write1(first_out, header1, seqs1.recs[idx1]);
+	seqs1Files[idx1] = first_out;	  	
 
       for(;idx2 < seqs2.recs.size(); ++idx2) 
-	if(second_out)
-	  sam_write1(second_out, header1, seqs2.recs[idx2]);
+	seqs2Files[idx2] = second_out;
+
+      // Figure out whether we're splitting the mates up in either case.
+      // If they are split up, clear mate information to make the file consistent.
+
+      if(!uniqueValue(seqs1Files))
+	clearMateInfo(seqs1);
+
+      if(!uniqueValue(seqs2Files))
+	clearMateInfo(seqs2);
+
+      for(int i = 0, ilim = seqs1.recs.size(); i != ilim; ++i) {
+
+	if(seqs1Files[i])
+	  seqs1Files[i]->write1(1, seqs1.recs[i]);
+
+      }
+
+      for(int i = 0, ilim = seqs2.recs.size(); i != ilim; ++i) {
+
+	if(seqs2Files[i])
+	  seqs2Files[i]->write1(2, seqs2.recs[i]);
+
+      }
 
     }
     else if(qname_cmp(qname1.c_str(), qname2.c_str()) < 0) {
 
       if(first_out)
-	sam_write1(first_out, header1, in1.rec);
+	first_out->write1(1, in1.rec);
       in1.next();
 
     }
     else {
 
       if(second_out)
-	sam_write1(second_out, header1, in2.rec);
+	second_out->write1(2, in2.rec);
       in2.next();
 
     }
@@ -634,14 +963,14 @@ int main(int argc, char** argv) {
 
   if(first_out) {
     while(!in1.is_eof()) {
-      sam_write1(first_out, header1, in1.rec);
+      first_out->write1(1, in1.rec);
       in1.next();
     }
   }
 
   if(second_out) {
     while(!in2.is_eof()) {
-      sam_write1(second_out, header1, in2.rec);
+      second_out->write1(2, in2.rec);
       in2.next();
     }
   }
@@ -649,14 +978,16 @@ int main(int argc, char** argv) {
   hts_close(in1hf);
   hts_close(in2hf);
   if(first_out)
-    hts_close(first_out);
+    htswrapper_close(first_out);
   if(second_out)
-    hts_close(second_out);
-
-  // Only close these if the hts handle wasn't shared with first/second_out.
-  if(firstbetter_out && ((!first_out) || strcmp(first_name, firstbetter_name) != 0))
-    hts_close(firstbetter_out);
-  if(secondbetter_out && ((!second_out) || strcmp(second_name, secondbetter_name) != 0))
-    hts_close(secondbetter_out);
+    htswrapper_close(second_out);
+  if(firstbetter_out)
+    htswrapper_close(firstbetter_out);
+  if(secondbetter_out)
+    htswrapper_close(secondbetter_out);
+  if(firstworse_out)
+    htswrapper_close(firstworse_out);
+  if(secondworse_out)
+    htswrapper_close(secondworse_out);
 
 }
