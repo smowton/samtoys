@@ -37,6 +37,17 @@ static int strnum_cmp(const char *_a, const char *_b)
     return *pa? 1 : *pb? -1 : 0;
 }
 
+static int get_as(const bam1_t* rec) {
+
+  uint8_t* score_rec = bam_aux_get(rec, "AS");
+  if(!score_rec) {
+    fprintf(stderr, "Fatal: At least record %s doesn't have an AS tag as required.\n", bam_get_qname(rec));
+    exit(1);
+  }
+  return bam_aux2i(score_rec);
+
+}
+
 static int flag2mate(const bam1_t* rec) {
 
   if(rec->core.flag & BAM_FREAD1)
@@ -86,9 +97,9 @@ struct BamRecVector {
 
 int main(int argc, char** argv) {
   
-  if(argc < 4) {
+  if(argc < 4 || argc > 5) {
 
-    fprintf(stderr, "Usage: filter_hits in.xam out.xam maxhits\n");
+    fprintf(stderr, "Usage: filter_hits in.xam out.xam maxhits [trim]\n");
     exit(1);
 
   }
@@ -109,6 +120,16 @@ int main(int argc, char** argv) {
   if(maxhits <= 0) {
     fprintf(stderr, "Argument 3 must be a number >= 1 specifying how many hits we're willing to keep\n");
     exit(1);
+  }
+
+  bool do_trim = false;
+  if(argc == 5) {
+    if(!strcmp(argv[4], "trim"))
+      do_trim = true;
+    else {
+      fprintf(stderr, "Argument 4 should be 'trim' if present"); 
+      exit(1);
+    }
   }
 
   bam_hdr_t* header = sam_hdr_read(hfi);
@@ -156,16 +177,46 @@ int main(int argc, char** argv) {
 
 	int blockSize = limRec - startRec;
 
+	if(blockSize >= counts.size())
+	  counts.resize(blockSize + 1);
+	++(counts[blockSize]);
+
+	if(do_trim) {
+	  
+	  if(maxhits != 1) {
+	    fprintf(stderr, "Trimming with maxhits != 1 not implemented yet\n");
+	    exit(1);
+	  }
+
+	  int bestRec = -1;
+	  int bestAS = -1;
+
+	  for(int i = startRec; i != limRec; ++i) {
+	   
+	    int as = get_as(matchingRecs.recs[i]);
+	    if(bestAS < as) {
+	      bestAS = as;
+	      bestRec = i;
+	    }
+
+	  }
+
+	  if(bestRec != -1) {
+
+	    startRec = bestRec;
+	    limRec = startRec + maxhits;
+	    blockSize = maxhits;
+
+	  }
+
+	}
+
 	if(blockSize <= maxhits) {
 
 	  for(int i = startRec; i != limRec; ++i)
 	    sam_write1(hfo, header, matchingRecs.recs[i]);
 
 	}
-
-	if(blockSize >= counts.size())
-	  counts.resize(blockSize + 1);
-	++(counts[blockSize]);
 
       }
 
