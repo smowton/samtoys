@@ -53,6 +53,8 @@ int main(int argc, char** argv) {
 
       if(cigar_op == BAM_CMATCH || cigar_op == BAM_CEQUAL)
 	matched_bases += cigar_len;
+      else if(cigar_op == BAM_CHARD_CLIP)
+	total_bases += cigar_len;
 
     }
 
